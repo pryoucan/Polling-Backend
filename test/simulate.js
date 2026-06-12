@@ -1,12 +1,34 @@
-// Lightweight end-to-end simulator / mini load test.
-// Spins up N concurrent voters who each join, then vote once on every question
-// as it opens. Useful both as a smoke test and a small concurrency check.
+// End-to-end load simulator. Two modes:
 //
-// Usage:  node test/simulate.js [voters] [baseUrl]
-//   node test/simulate.js 50 http://localhost:8080
+//   sse  (default) — each virtual voter behaves like a REAL browser: it opens a
+//                    persistent SSE connection to /api/events and votes the
+//                    moment a question opens. This reproduces the two things a
+//                    real live event does that plain polling does not:
+//                      (1) thousands of concurrent long-lived connections, and
+//                      (2) a synchronized vote burst when each question opens.
+// //
+//   poll           — legacy: each voter polls /api/state on a loop. Stresses the
+//                    request/DB path hard, but opens no live connection and
+//                    smooths away the vote burst. Useful for raw-throughput runs.
+//
+// Usage:  node test/simulate.js [voters] [baseUrl] [mode]
+//   node test/simulate.js 2000 http://localhost:8080            # sse (real-ish)
+//   node test/simulate.js 2000 http://localhost:8080 poll       # legacy polling
+//
+// NOTE: holding thousands of OPEN SSE sockets from one machine hits the OS
+// file-descriptor/port limit (raise it with `ulimit -n 100000`). For true 10k+,
+// run several of these across multiple machines.
 
 const VOTERS = parseInt(process.argv[2] ?? '20', 10);
 const BASE = process.argv[3] ?? 'http://localhost:8080';
+const MODE = (process.argv[4] ?? 'sse').toLowerCase();
+
+// Stagger voter start-up so they connect over a few seconds instead of all in
+// the same millisecond — more realistic, and it stops one Node process from
+// stampeding the /join endpoint (and itself).
+const RAMP_MS = 3;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function cookieFrom(res) {
   const sc = res.headers.get('set-cookie');
@@ -50,16 +72,126 @@ function pickOptions(question) {
   return [...picks];
 }
 
-async function runVoter(i, stats) {
+// --- SSE mode: behave like a real browser EventSource. ---
+
+// Minimal SSE parser over native fetch streaming. Splits the byte stream into
+// `\n\n`-delimited frames and pulls out the `event:`/`data:` fields. Stops as
+// soon as isDone() returns true (so a voter exits promptly on 'complete').
+async function consumeSse(res, onEvent, isDone) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  outer: for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const frame = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let event = 'message';
+      let data = '';
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
+        // ignore comment (': ping') and 'retry:' lines
+      }
+      if (data) onEvent(event, data);
+      if (isDone()) break outer;
+    }
+  }
+  try {
+    await reader.cancel();
+  } catch {
+    /* already closed */
+  }
+}
+
+async function runVoterSse(i, stats) {
   const cookie = await join(`Voter ${i}`);
-  if (!cookie) { stats.joinFail++; return; }
+  if (!cookie) {
+    stats.joinFail++;
+    return;
+  }
+  stats.joined++;
+
+  // Open the live stream — public, exactly like a real browser's EventSource.
+  let res;
+  try {
+    res = await fetch(`${BASE}/api/events`, { headers: { Accept: 'text/event-stream' } });
+  } catch {
+    stats.sseFail++;
+    return;
+  }
+  if (!res.ok || !res.body) {
+    stats.sseFail++;
+    return;
+  }
+  stats.connected++;
+
+  const voted = new Set();
+  let finished = false;
+
+  const onEvent = (event, data) => {
+    if (event !== 'state') return;
+    let msg;
+    try {
+      msg = JSON.parse(data);
+    } catch {
+      return;
+    }
+    const s = msg.state;
+    if (!s) return;
+    if (s.phase === 'complete') {
+      finished = true;
+      return;
+    }
+    // A new voting question just opened (pushed to everyone at once). Vote once.
+    if (s.phase === 'voting' && s.question && !voted.has(s.question.id)) {
+      voted.add(s.question.id); // guard synchronously so we never double-vote
+      // Human-ish think time so 10k clients don't hit the exact same millisecond,
+      // but still inside a tight window -> realistic burst.
+      (async () => {
+        await sleep(200 + Math.random() * 1300);
+        try {
+          const r = await vote(cookie, s.question.id, pickOptions(s.question));
+          if (r.status === 200) stats.votes++;
+          else stats.voteRejected++;
+        } catch {
+          stats.voteRejected++;
+        }
+      })();
+    }
+  };
+
+  try {
+    await consumeSse(res, onEvent, () => finished);
+  } catch {
+    /* connection dropped */
+  }
+  stats.connected--;
+  stats.finished++;
+}
+
+// --- poll mode (legacy): hammer /state on a loop, no live connection. ---
+
+async function runVoterPoll(i, stats) {
+  const cookie = await join(`Voter ${i}`);
+  if (!cookie) {
+    stats.joinFail++;
+    return;
+  }
   stats.joined++;
 
   const votedQuestions = new Set();
-  // Poll state until the poll completes.
   for (;;) {
     let st;
-    try { st = await getState(cookie); } catch { await sleep(500); continue; }
+    try {
+      st = await getState(cookie);
+    } catch {
+      await sleep(500);
+      continue;
+    }
 
     if (st.phase === 'complete') break;
     if (st.phase === 'voting' && st.question && !votedQuestions.has(st.question.id)) {
@@ -73,16 +205,24 @@ async function runVoter(i, stats) {
   stats.finished++;
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 async function main() {
-  console.log(`Simulating ${VOTERS} voters against ${BASE}`);
-  const stats = { joined: 0, joinFail: 0, votes: 0, voteRejected: 0, finished: 0 };
-  const voters = Array.from({ length: VOTERS }, (_, i) => runVoter(i + 1, stats));
+  console.log(`Simulating ${VOTERS} voters against ${BASE}  [mode=${MODE}]`);
+  const stats = { joined: 0, joinFail: 0, connected: 0, sseFail: 0, votes: 0, voteRejected: 0, finished: 0 };
+  const runVoter = MODE === 'poll' ? runVoterPoll : runVoterSse;
 
-  // Progress ticker.
+  // Ramp: stagger each voter's start so they don't all fire at once.
+  const voters = Array.from({ length: VOTERS }, (_, i) =>
+    (async () => {
+      await sleep(i * RAMP_MS);
+      return runVoter(i + 1, stats);
+    })(),
+  );
+
+  // Progress ticker. `connected` = live SSE connections (the metric that matters).
   const ticker = setInterval(() => {
-    process.stdout.write(`\r joined=${stats.joined} votes=${stats.votes} rejected=${stats.voteRejected} finished=${stats.finished}   `);
+    process.stdout.write(
+      `\r joined=${stats.joined} connected=${stats.connected} votes=${stats.votes} rejected=${stats.voteRejected} sseFail=${stats.sseFail} finished=${stats.finished}   `,
+    );
   }, 1000);
 
   await Promise.all(voters);
@@ -96,4 +236,7 @@ async function main() {
   }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

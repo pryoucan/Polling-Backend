@@ -15,6 +15,7 @@ let publisher = null;
 let subscriber = null;
 let state = null; // in-memory mirror of the current authoritative state
 let runId = 0; // bumped to cancel the currently-running poll loop
+let advanceRequested = false; // set by the 'next' command to advance a host-gated phase
 
 // pause/resume bookkeeping
 let running = false; // true while a poll loop is active
@@ -199,6 +200,29 @@ async function enterTimedPhase(stateObj) {
   await setState(stateObj);
 }
 
+// Enter a host-gated phase (lobby / results): no timer, nothing to pause. The
+// loop blocks in waitForNext() until the host clicks Next.
+async function enterHeldPhase(stateObj) {
+  phaseSnapshot = null; // a held phase has no countdown to freeze
+  phaseDeadline = 0;
+  await setState(stateObj);
+}
+
+// Wait until the host issues 'next' (or the run is cancelled by start/stop/
+// reset). Used for the host-gated phases, which have no auto timer. Returns
+// true when advanced, false if the run was superseded.
+async function waitForNext(isActive) {
+  advanceRequested = false; // ignore any stray click from the previous phase
+  for (;;) {
+    if (!isActive()) return false;
+    if (advanceRequested) {
+      advanceRequested = false;
+      return true;
+    }
+    await sleep(120);
+  }
+}
+
 // Wait until the current phase's deadline, honoring pause. Returns true when the
 // phase completes, false if the run was cancelled (start/stop/reset).
 async function waitPhase(isActive) {
@@ -223,21 +247,19 @@ async function runPoll(isActive) {
     await query(`UPDATE poll SET status = 'running' WHERE id = $1`, [poll.id]);
     const total = poll.questions.length;
 
-    // Lobby.
+    // Lobby — held until the host clicks Begin (no auto timer).
     if (!isActive()) return;
-    console.log(`[clock] lobby for ${config.lobbySeconds}s — ${total} questions queued`);
-    const lobbyOpens = Date.now();
-    await enterTimedPhase({
+    console.log(`[clock] lobby — waiting for host to begin (${total} questions queued)`);
+    await enterHeldPhase({
       pollId: poll.id,
       title: poll.title,
       phase: 'lobby',
       total,
       question: null,
-      opensAt: lobbyOpens,
-      closesAt: lobbyOpens + config.lobbySeconds * 1000,
+      awaitingNext: true,
       serverNow: Date.now(),
     });
-    if (!(await waitPhase(isActive))) return;
+    if (!(await waitForNext(isActive))) return;
 
     for (const question of poll.questions) {
       if (!isActive()) return;
@@ -271,8 +293,8 @@ async function runPoll(isActive) {
       if (!isActive()) return;
 
       const { tally, winners, leaderboard } = await closeQuestion(poll, question);
-      const rOpens = Date.now();
-      await enterTimedPhase({
+      // Results — held until the host clicks Next (no auto timer).
+      await enterHeldPhase({
         pollId: poll.id,
         title: poll.title,
         phase: 'results',
@@ -281,11 +303,10 @@ async function runPoll(isActive) {
         tally,
         winners,
         leaderboard,
-        opensAt: rOpens,
-        closesAt: rOpens + config.resultsSeconds * 1000,
+        awaitingNext: true,
         serverNow: Date.now(),
       });
-      if (!(await waitPhase(isActive))) return;
+      if (!(await waitForNext(isActive))) return;
     }
 
     if (!isActive()) return;
@@ -312,7 +333,15 @@ async function runPoll(isActive) {
 function cancelCurrentRun() {
   runId += 1; // any in-flight runPoll sees its isActive() turn false
   paused = false;
+  advanceRequested = false;
   phaseSnapshot = null;
+}
+
+// Advance a host-gated phase: lobby -> first question, or results -> next
+// question (or -> complete after the last one). No-op if nothing is waiting.
+function advancePoll() {
+  if (!running) return;
+  advanceRequested = true;
 }
 
 // Pause: freeze the current phase, remembering how much time was left.
@@ -386,6 +415,8 @@ async function handleControl(raw) {
       return pausePoll();
     case 'resume':
       return resumePoll();
+    case 'next':
+      return advancePoll();
     default:
       console.warn('[clock] unknown control command:', msg.cmd);
   }

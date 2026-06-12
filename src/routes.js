@@ -135,6 +135,14 @@ export function buildRouter() {
 
       if (!inserted) return res.status(409).json({ error: 'you already voted on this question' });
     } catch (err) {
+      // 23503 = foreign_key_violation. The only FK that can fail here is
+      // participant_id (question_id/option_id are validated above): it means
+      // this token's participant row no longer exists — e.g. the DB was
+      // reset/swapped after they joined. Signal the client to re-join with a
+      // fresh participant instead of returning an opaque 500.
+      if (err.code === '23503') {
+        return res.status(401).json({ error: 'session expired, please re-join', code: 'REJOIN' });
+      }
       console.error('vote insert failed:', err.message);
       return res.status(500).json({ error: 'could not record vote' });
     }

@@ -31,7 +31,7 @@ services:
       # is the container itself — Redis lives in the "redis" container on 6379.
       # This wins over whatever REDIS_URL is in .env.
       REDIS_URL: redis://redis:6379
-      WORKERS: "2" # 2 vCPU box → one worker per core; primary shares.
+      WORKERS: "7" # 8 vCPU box → one worker per core, minus one for the primary.
     depends_on:
       redis:
         condition: service_healthy

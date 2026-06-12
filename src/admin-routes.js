@@ -55,6 +55,12 @@ export function buildAdminRouter() {
     res.json({ ok: true, cmd: 'resume' });
   });
 
+  // Advance a host-gated phase: lobby -> first question, or results -> next.
+  router.post('/next', async (_req, res) => {
+    await sendCommand('next');
+    res.json({ ok: true, cmd: 'next' });
+  });
+
   // Halt + wipe votes/scores, back to idle.
   router.post('/reset', async (_req, res) => {
     await sendCommand('reset');
