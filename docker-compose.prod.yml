@@ -1,0 +1,44 @@
+# Production stack for AWS (single EC2 instance).
+#   - Postgres: NOT here — uses managed RDS (via DB_* vars in .env).
+#   - Redis:    runs as a container on this box (pub/sub bus between the
+#               primary clock and the HTTP workers).
+#   - server:   the Node cluster app, configured entirely from ./.env.
+#
+# Deploy:  docker compose -f docker-compose.prod.yml up -d --build
+services:
+  redis:
+    image: redis:7-alpine
+    # No host port published: only the server container needs Redis, and it
+    # reaches it by service name over the internal network. Not exposed to the
+    # internet.
+    networks:
+      - polling-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build: ./
+    ports:
+      - "8080:8080" # host:container — your EC2 security group must allow 8080
+    # All config (RDS creds, secrets, CORS, timings) comes from ./.env on the box.
+    env_file: .env
+    environment:
+      # Override Redis to the in-network service name. Inside Docker, "localhost"
+      # is the container itself — Redis lives in the "redis" container on 6379.
+      # This wins over whatever REDIS_URL is in .env.
+      REDIS_URL: redis://redis:6379
+      WORKERS: "2" # 2 vCPU box → one worker per core; primary shares.
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - polling-net
+    restart: unless-stopped
+
+networks:
+  polling-net:
+    driver: bridge

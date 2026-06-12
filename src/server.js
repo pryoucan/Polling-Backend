@@ -45,7 +45,7 @@ if (cluster.isPrimary) {
       origin: config.corsOrigins.length ? config.corsOrigins : true,
       credentials: true,
     }),
-  );
+  ); 
 
   initSseBus();
 

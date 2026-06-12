@@ -16,8 +16,16 @@ function weights() {
 }
 
 export const config = {
-  databaseUrl: process.env.DATABASE_URL ?? 'postgres://polling:polling@localhost:5433/polling',
-  pgSsl: process.env.PGSSL === 'true',
+  // Prefer an explicit DATABASE_URL; otherwise assemble one from the discrete
+  // DB_* vars (the form used for RDS). Falls back to the local docker default.
+  databaseUrl:
+    process.env.DATABASE_URL ??
+    (process.env.DB_HOST
+      ? `postgres://${process.env.DB_USER}:${encodeURIComponent(process.env.DB_PASSWORD ?? '')}` +
+        `@${process.env.DB_HOST}:${process.env.DB_PORT ?? 5432}/${process.env.DB_NAME}`
+      : 'postgres://polling:polling@localhost:5433/polling'),
+  // RDS uses PGSSL=require; local dev leaves it false. Accept both spellings.
+  pgSsl: process.env.PGSSL === 'true' || process.env.PGSSL === 'require',
   pgPoolMax: int('PG_POOL_MAX', 10),
 
   redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6380',
