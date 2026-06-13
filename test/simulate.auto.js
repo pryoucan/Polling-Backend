@@ -174,14 +174,23 @@ async function adminStatus() {
   return res.json();
 }
 
-async function adminCmd(cmd) {
-  const res = await fetch(`${BASE}/api/admin/${cmd}`, {
-    method: 'POST',
-    headers: { 'x-admin-token': ADMIN_TOKEN, 'Content-Type': 'application/json' },
-    body: '{}',
-  });
-  if (!res.ok) throw new Error(`admin ${cmd} -> ${res.status}`);
-  return res.json();
+// Retry transient failures (e.g. the server is briefly slow under a vote burst
+// and the request times out) instead of letting one blip crash the whole run.
+async function adminCmd(cmd, tries = 5) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(`${BASE}/api/admin/${cmd}`, {
+        method: 'POST',
+        headers: { 'x-admin-token': ADMIN_TOKEN, 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      if (res.ok) return res.json();
+    } catch {
+      /* network error / timeout — retry below */
+    }
+    await sleep(1000);
+  }
+  return null; // gave up; caller logs and keeps going
 }
 
 // Drives: pending -> start -> (lobby -> next) -> [voting -> auto-close -> results
@@ -209,16 +218,22 @@ async function drivePoll(log) {
 
     if (st.phase === 'pending' || st.phase === 'unknown') {
       if (!started) {
-        await adminCmd('start'); // clears prior run, enters lobby
-        started = true;
-        log('started — entering lobby');
+        if (await adminCmd('start')) {
+          started = true;
+          log('started — entering lobby');
+        } else {
+          log('start failed — retrying');
+        }
       }
     } else if (st.phase === 'lobby') {
       if (actedKey !== 'lobby') {
-        await adminCmd('next');
-        opened++;
-        actedKey = 'lobby';
-        log(`opened question ${opened}/${MAX_QUESTIONS}`);
+        if (await adminCmd('next')) {
+          opened++;
+          actedKey = 'lobby';
+          log(`opened question ${opened}/${MAX_QUESTIONS}`);
+        } else {
+          log('next failed — retrying');
+        }
       }
     } else if (st.phase === 'results') {
       if (opened >= MAX_QUESTIONS) {
@@ -229,10 +244,13 @@ async function drivePoll(log) {
       const key = `results:${st.questionIndex}`;
       if (actedKey !== key) {
         await sleep(RESULTS_PAUSE_MS); // let voters/leaderboard settle
-        await adminCmd('next');
-        opened++;
-        actedKey = key;
-        log(`opened question ${opened}/${MAX_QUESTIONS}`);
+        if (await adminCmd('next')) {
+          opened++;
+          actedKey = key;
+          log(`opened question ${opened}/${MAX_QUESTIONS}`);
+        } else {
+          log('next failed — retrying');
+        }
       }
     }
     // 'voting' -> do nothing; wait for it to auto-close.
@@ -276,8 +294,17 @@ async function main() {
 
   const log = (m) => process.stdout.write(`\n[driver] ${m}\n`);
 
-  // Give voters a head start to connect, then drive the poll.
-  await sleep(CONNECT_GRACE_MS + VOTERS * RAMP_MS);
+  // Wait for most voters to actually CONNECT before driving the poll — otherwise
+  // (on a slow client) questions open while nobody's connected and votes are
+  // missed. Proceed once 90% are connected, or after a hard cap, whichever first.
+  const target = Math.floor(VOTERS * 0.9);
+  const maxWaitMs = 90_000;
+  let waited = 0;
+  while (stats.connected < target && stats.connected + stats.joinFail + stats.sseFail < VOTERS && waited < maxWaitMs) {
+    await sleep(500);
+    waited += 500;
+  }
+  log(`${stats.connected}/${VOTERS} connected — starting poll`);
   await drivePoll(log);
 
   // Poll is stopped/complete: tell voters to close and finish up.
