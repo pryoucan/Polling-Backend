@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS vote (
 
 -- Powers the authoritative per-question tally (GROUP BY option_id) at close time.
 CREATE INDEX IF NOT EXISTS idx_vote_question ON vote(question_id);
-
+ 
 -- Final settled leaderboard. Written incrementally as each question closes.
 CREATE TABLE IF NOT EXISTS score (
     poll_id        INT  NOT NULL REFERENCES poll(id) ON DELETE CASCADE,

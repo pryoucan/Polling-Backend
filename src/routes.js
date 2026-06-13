@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { getLeaderboard, getParticipantStanding } from './leaderboard.js';
 import { makeToken, setSessionCookie, withParticipant } from './auth.js';
 import { addClient } from './sse.js';
+import { asyncHandler, errorHandler } from './http-helpers.js';
 
 const LATE_GRACE_MS = 750; // allow votes that left the client just before close
 
@@ -19,7 +20,7 @@ export function buildRouter() {
   router.use(withParticipant);
 
   // --- Join: create an anonymous participant, set the signed cookie. ---
-  router.post('/join', async (req, res) => {
+  router.post('/join', asyncHandler(async (req, res) => {
     const name = String(req.body?.name ?? '').trim().slice(0, 40);
     if (name.length < 1) return res.status(400).json({ error: 'name required' });
 
@@ -45,10 +46,10 @@ export function buildRouter() {
     // (cross-origin React client stores it and sends it as a Bearer header).
     setSessionCookie(res, token);
     res.json({ id, name: finalName, token });
-  });
+  }));
 
   // --- Current state snapshot (used on load and on reconnect). ---
-  router.get('/state', async (req, res) => {
+  router.get('/state', asyncHandler(async (req, res) => {
     const state = await readState();
     if (!state) return res.json({ phase: 'pending' });
 
@@ -66,18 +67,18 @@ export function buildRouter() {
       }
     }
     res.json(out);
-  });
+  }));
 
   // --- Leaderboard (top N). ---
-  router.get('/leaderboard', async (req, res) => {
+  router.get('/leaderboard', asyncHandler(async (req, res) => {
     const state = await readState();
     if (!state?.pollId) return res.json({ leaderboard: [] });
     const limit = Math.min(parseInt(req.query.limit ?? '20', 10) || 20, 100);
     res.json({ leaderboard: await getLeaderboard(state.pollId, limit) });
-  });
+  }));
 
   // --- Vote. ---
-  router.post('/vote', async (req, res) => {
+  router.post('/vote', asyncHandler(async (req, res) => {
     if (!req.participantId) return res.status(401).json({ error: 'join first' });
 
     const state = await readState();
@@ -158,12 +159,16 @@ export function buildRouter() {
     }
 
     res.json({ ok: true });
-  });
+  }));
 
   // --- SSE stream. ---
   router.get('/events', (req, res) => {
     addClient(req, res);
   });
+
+  // Tail error handler: a rejected async handler lands here as a 503 instead of
+  // crashing the worker. Must be registered after all routes.
+  router.use(errorHandler);
 
   return router;
 }

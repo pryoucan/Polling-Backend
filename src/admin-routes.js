@@ -5,6 +5,7 @@ import express from 'express';
 import { redis } from './redis.js';
 import { query } from './db.js';
 import { config } from './config.js';
+import { asyncHandler, errorHandler } from './http-helpers.js';
 
 // Escape a field for CSV (wrap in quotes, double internal quotes).
 function csvCell(v) {
@@ -32,51 +33,51 @@ export function buildAdminRouter() {
   router.use(requireAdmin);
 
   // Start (or restart) the poll from the lobby. Clears previous run's scores.
-  router.post('/start', async (_req, res) => {
+  router.post('/start', asyncHandler(async (_req, res) => {
     await sendCommand('start');
     res.json({ ok: true, cmd: 'start' });
-  });
+  }));
 
   // Halt the poll and return everyone to the idle/standby screen.
-  router.post('/stop', async (_req, res) => {
+  router.post('/stop', asyncHandler(async (_req, res) => {
     await sendCommand('stop');
     res.json({ ok: true, cmd: 'stop' });
-  });
+  }));
 
   // Pause: freeze the current question with its remaining time intact.
-  router.post('/pause', async (_req, res) => {
+  router.post('/pause', asyncHandler(async (_req, res) => {
     await sendCommand('pause');
     res.json({ ok: true, cmd: 'pause' });
-  });
+  }));
 
   // Resume: continue from exactly where it was paused.
-  router.post('/resume', async (_req, res) => {
+  router.post('/resume', asyncHandler(async (_req, res) => {
     await sendCommand('resume');
     res.json({ ok: true, cmd: 'resume' });
-  });
+  }));
 
   // Advance a host-gated phase: lobby -> first question, or results -> next.
-  router.post('/next', async (_req, res) => {
+  router.post('/next', asyncHandler(async (_req, res) => {
     await sendCommand('next');
     res.json({ ok: true, cmd: 'next' });
-  });
+  }));
 
   // Halt + wipe votes/scores, back to idle.
-  router.post('/reset', async (_req, res) => {
+  router.post('/reset', asyncHandler(async (_req, res) => {
     await sendCommand('reset');
     res.json({ ok: true, cmd: 'reset' });
-  });
+  }));
 
   // Replace the questions with a freshly seeded set of `count` questions.
-  router.post('/reseed', async (req, res) => {
+  router.post('/reseed', asyncHandler(async (req, res) => {
     const count = Math.min(Math.max(parseInt(req.body?.count, 10) || 100, 1), 500);
     await sendCommand('reseed', { count });
     res.json({ ok: true, cmd: 'reseed', count });
-  });
+  }));
 
   // Export the top-N options for every question that has closed.
   // ?top=10 (default), ?format=csv|json (default json).
-  router.get('/results', async (req, res) => {
+  router.get('/results', asyncHandler(async (req, res) => {
     const top = Math.min(Math.max(parseInt(req.query.top, 10) || 10, 1), 50);
     const { rows } = await query(
       `SELECT q.position, q.prompt, qr.tally
@@ -104,10 +105,10 @@ export function buildAdminRouter() {
     }
 
     res.json({ questionsClosed: results.length, top, results });
-  });
+  }));
 
   // Current poll status (read from the authoritative Redis state).
-  router.get('/status', async (_req, res) => {
+  router.get('/status', asyncHandler(async (_req, res) => {
     const raw = await redis.get(config.stateKey);
     const state = raw ? JSON.parse(raw) : null;
     res.json({
@@ -118,7 +119,11 @@ export function buildAdminRouter() {
       questionIndex: state?.question?.index ?? null,
       questionPrompt: state?.question?.prompt ?? null,
     });
-  });
+  }));
+
+  // Tail error handler: a rejected async handler lands here as a 503 instead of
+  // crashing the worker. Must be registered after all routes.
+  router.use(errorHandler);
 
   return router;
 }
