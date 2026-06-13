@@ -42,21 +42,33 @@ async function getState(cookie) {
 }
 
 async function join(name) {
-  const res = await fetch(`${BASE}/api/join`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
-  });
-  return cookieFrom(res);
+  // Swallow transient network errors (ECONNRESET, etc.) so one blip under load
+  // doesn't abort the whole simulation — the caller treats null as a join fail.
+  try {
+    const res = await fetch(`${BASE}/api/join`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    return cookieFrom(res);
+  } catch {
+    return null;
+  }
 }
 
 async function vote(cookie, questionId, optionIds) {
-  const res = await fetch(`${BASE}/api/vote`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', cookie },
-    body: JSON.stringify({ questionId, optionIds }),
-  });
-  return { status: res.status, body: await res.json().catch(() => ({})) };
+  // status 0 = the request never completed (transient network reset); callers
+  // treat anything that isn't 200 as a rejected vote and keep going.
+  try {
+    const res = await fetch(`${BASE}/api/vote`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', cookie },
+      body: JSON.stringify({ questionId, optionIds }),
+    });
+    return { status: res.status, body: await res.json().catch(() => ({})) };
+  } catch {
+    return { status: 0, body: {} };
+  }
 }
 
 function pickOptions(question) {
@@ -218,21 +230,27 @@ async function main() {
     })(),
   );
 
-  // Progress ticker. `connected` = live SSE connections (the metric that matters).
+  // Progress ticker. `connected` = live SSE connections (the metric that matters);
+  // joinFail = joins the server/proxy refused or reset (the real capacity signal).
   const ticker = setInterval(() => {
     process.stdout.write(
-      `\r joined=${stats.joined} connected=${stats.connected} votes=${stats.votes} rejected=${stats.voteRejected} sseFail=${stats.sseFail} finished=${stats.finished}   `,
+      `\r joined=${stats.joined} joinFail=${stats.joinFail} connected=${stats.connected} votes=${stats.votes} rejected=${stats.voteRejected} sseFail=${stats.sseFail} finished=${stats.finished}   `,
     );
   }, 1000);
 
-  await Promise.all(voters);
+  // allSettled (not all): one voter throwing must never abort the whole run.
+  await Promise.allSettled(voters);
   clearInterval(ticker);
 
-  const lb = await (await fetch(`${BASE}/api/leaderboard?limit=10`)).json();
   console.log(`\n\nFinal stats:`, stats);
-  console.log(`\nTop 10 leaderboard:`);
-  for (const row of lb.leaderboard) {
-    console.log(`  #${row.rank}  ${row.name.padEnd(12)} ${row.points} pts`);
+  try {
+    const lb = await (await fetch(`${BASE}/api/leaderboard?limit=10`)).json();
+    console.log(`\nTop 10 leaderboard:`);
+    for (const row of lb.leaderboard ?? []) {
+      console.log(`  #${row.rank}  ${row.name.padEnd(12)} ${row.points} pts`);
+    }
+  } catch (e) {
+    console.log(`\n(leaderboard fetch failed: ${e.cause?.code ?? e.message})`);
   }
 }
 
