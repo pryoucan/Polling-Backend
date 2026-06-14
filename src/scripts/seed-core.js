@@ -4,8 +4,10 @@
 import { query, withTx } from '../db.js';
 import { CATEGORIES } from './content.js';
 
-const MIN_SELECT = 1;
-const MAX_SELECT = 5;
+// Every question requires exactly 3 selections — pick your 3, the top-3
+// most-voted options win points (weights 3/2/1).
+const MIN_SELECT = 3;
+const MAX_SELECT = 3;
 
 export async function pollExists() {
   const { rows } = await query('SELECT 1 FROM poll LIMIT 1');
