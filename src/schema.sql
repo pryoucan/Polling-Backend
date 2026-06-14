@@ -32,6 +32,14 @@ CREATE TABLE IF NOT EXISTS participant (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Speeds up the /join duplicate-name check. That query does both an equality
+-- match (lower(display_name) = ...) and a prefix LIKE (... LIKE 'name (%'); the
+-- text_pattern_ops opclass serves BOTH, so the check becomes an index probe
+-- instead of a full table scan on every single join. Without this, a burst of
+-- thousands of joins is O(n^2) and pegs the DB CPU (the load-test hot spot).
+CREATE INDEX IF NOT EXISTS idx_participant_lower_name
+    ON participant (lower(display_name) text_pattern_ops);
+
 -- One row guarantees a participant can only submit ONCE per question (atomic guard).
 CREATE TABLE IF NOT EXISTS question_submission (
     participant_id UUID NOT NULL REFERENCES participant(id) ON DELETE CASCADE,
@@ -51,6 +59,13 @@ CREATE TABLE IF NOT EXISTS vote (
 
 -- Powers the authoritative per-question tally (GROUP BY option_id) at close time.
 CREATE INDEX IF NOT EXISTS idx_vote_question ON vote(question_id);
+
+-- The vote PK is (participant_id, option_id), so option_id can't be looked up via
+-- the PK. But closeQuestion filters votes BY option_id twice — the tally join
+-- (v.option_id = o.id) and the per-winner scoring (WHERE v.option_id = $1).
+-- Without this index those are full scans of the (large) vote table on every
+-- question close. Indexing option_id turns them into index lookups.
+CREATE INDEX IF NOT EXISTS idx_vote_option ON vote(option_id);
  
 -- Final settled leaderboard. Written incrementally as each question closes.
 CREATE TABLE IF NOT EXISTS score (
