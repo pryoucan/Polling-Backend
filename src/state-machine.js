@@ -6,10 +6,19 @@
 import { query, withTx } from './db.js';
 import { redis, keys } from './redis.js';
 import { config } from './config.js';
-import { getLeaderboard } from './leaderboard.js';
+import { getLeaderboard, getSegmentLeaderboard } from './leaderboard.js';
 import { seedPoll } from './scripts/seed-core.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Which segment (0-based block of `segmentSize` questions) a question index
+// falls in, and its inclusive position range. e.g. size 10, index 12 -> seg 1,
+// positions 10..19. Used to scope the rolling segment leaderboard.
+function segmentRange(questionIndex) {
+  const size = config.segmentSize;
+  const index = Math.floor(questionIndex / size);
+  return { index, size, from: index * size, to: index * size + size - 1 };
+}
 
 let publisher = null;
 let subscriber = null;
@@ -129,10 +138,23 @@ async function closeQuestion(poll, question) {
          DO UPDATE SET points = score.points + EXCLUDED.points`,
         [poll.id, weight, w.optionId],
       );
+      // Same award recorded per-question — this is what the segment leaderboard
+      // sums over a 10-question range (overall total lives in `score` above).
+      await c.query(
+        `INSERT INTO question_score (question_id, participant_id, points)
+         SELECT $1, v.participant_id, $2
+           FROM vote v
+          WHERE v.option_id = $3
+         ON CONFLICT (question_id, participant_id)
+         DO UPDATE SET points = question_score.points + EXCLUDED.points`,
+        [question.id, weight, w.optionId],
+      );
     }
   });
 
   const leaderboard = await getLeaderboard(poll.id, 20);
+  const seg = segmentRange(question.index);
+  const segmentLeaderboard = await getSegmentLeaderboard(poll.id, seg.from, seg.to, 20);
   const winnersOut = winners.map((w) => ({ ...w, weight: config.scoreWeights[w.rank - 1] ?? 0 }));
   await publish({
     type: 'result',
@@ -140,8 +162,10 @@ async function closeQuestion(poll, question) {
     tally,
     winners: winnersOut,
     leaderboard,
+    segment: seg, // { index, size, from, to }
+    segmentLeaderboard, // standings for THIS 10-question block
   });
-  return { tally, winners: winnersOut, leaderboard };
+  return { tally, winners: winnersOut, leaderboard, segment: seg, segmentLeaderboard };
 }
 
 // Periodically push the LIVE (cosmetic) tally from Redis during a voting window.
@@ -188,7 +212,7 @@ async function setIdle() {
 // question closes again). Reseed still clears everything via CASCADE.
 // Participants stay registered so they remain logged in across a restart.
 async function clearRuntimeData() {
-  await query('TRUNCATE vote, question_submission, score RESTART IDENTITY');
+  await query('TRUNCATE vote, question_submission, score, question_score RESTART IDENTITY');
 }
 
 // Enter a timed phase: remember it (so pause/resume can re-broadcast it) and
@@ -268,6 +292,10 @@ async function runPoll(isActive) {
 
       await redis.del(keys.tally(question.id)); // fresh live count
 
+      // Segment standings going INTO this question (empty at the start of a new
+      // round, then reflects the earlier questions in the block).
+      const votingSeg = segmentRange(question.index);
+      const votingSegBoard = await getSegmentLeaderboard(poll.id, votingSeg.from, votingSeg.to, 20);
       await enterTimedPhase({
         pollId: poll.id,
         title: poll.title,
@@ -283,16 +311,23 @@ async function runPoll(isActive) {
         },
         opensAt,
         closesAt,
+        segment: votingSeg, // which 10-question block / round this is
+        segmentLeaderboard: votingSegBoard,
         serverNow: Date.now(),
       });
       console.log(`[clock] Q${question.index + 1}/${total} "${question.prompt}" open for ${config.voteSeconds}s`);
       startLiveTally(question, closesAt);
 
       if (!(await waitPhase(isActive))) return;
-      await sleep(400); // small grace for in-flight votes
+      // Wait past the vote grace window before tallying. routes.js accepts votes
+      // up to closesAt + LATE_GRACE_MS (750ms); we wait 1000ms so there's a
+      // comfortable ~250ms margin for an accepted vote's transaction to COMMIT
+      // before the tally reads — otherwise, under DB load, a last-instant vote
+      // could commit after the tally and silently miss the count/scoring.
+      await sleep(1000);
       if (!isActive()) return;
 
-      const { tally, winners, leaderboard } = await closeQuestion(poll, question);
+      const { tally, winners, leaderboard, segment, segmentLeaderboard } = await closeQuestion(poll, question);
       // Results — held until the host clicks Next (no auto timer).
       await enterHeldPhase({
         pollId: poll.id,
@@ -303,6 +338,9 @@ async function runPoll(isActive) {
         tally,
         winners,
         leaderboard,
+        segment, // { index, size, from, to } of the 10-question block this question belongs to
+        segmentLeaderboard, // standings for that block
+        segmentEnd: question.index === segment.to || question.index === total - 1, // last Q of a block → prize moment
         awaitingNext: true,
         serverNow: Date.now(),
       });
@@ -312,6 +350,8 @@ async function runPoll(isActive) {
     if (!isActive()) return;
     await query(`UPDATE poll SET status = 'complete' WHERE id = $1`, [poll.id]);
     const finalBoard = await getLeaderboard(poll.id, 50);
+    const lastSeg = segmentRange(total - 1);
+    const lastSegBoard = await getSegmentLeaderboard(poll.id, lastSeg.from, lastSeg.to, 50);
     phaseSnapshot = null; // nothing pausable once complete
     await setState({
       pollId: poll.id,
@@ -320,6 +360,9 @@ async function runPoll(isActive) {
       total,
       question: null,
       leaderboard: finalBoard,
+      segment: lastSeg, // the final block's standings, for one last prize moment
+      segmentLeaderboard: lastSegBoard,
+      segmentEnd: true,
       serverNow: Date.now(),
     });
     console.log('[clock] poll complete');

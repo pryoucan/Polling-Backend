@@ -5,6 +5,7 @@ import express from 'express';
 import { redis } from './redis.js';
 import { query } from './db.js';
 import { config } from './config.js';
+import { getLeaderboard, getSegmentLeaderboard } from './leaderboard.js';
 import { asyncHandler, errorHandler } from './http-helpers.js';
 
 // Escape a field for CSV (wrap in quotes, double internal quotes).
@@ -119,6 +120,40 @@ export function buildAdminRouter() {
       questionIndex: state?.question?.index ?? null,
       questionPrompt: state?.question?.prompt ?? null,
     });
+  }));
+
+  // Host-only leaderboards WITH full phone numbers (for contacting prize
+  // winners). NEVER exposed publicly — the public /api/leaderboard returns only
+  // the last 4 digits. Returns overall + the current 10-question segment.
+  router.get('/leaderboard', asyncHandler(async (_req, res) => {
+    const raw = await redis.get(config.stateKey);
+    const state = raw ? JSON.parse(raw) : null;
+    if (!state?.pollId) return res.json({ leaderboard: [], segment: null });
+    const leaderboard = await getLeaderboard(state.pollId, 50, true);
+    let segment = null;
+    const idx = state.question?.index;
+    if (idx != null) {
+      const size = config.segmentSize;
+      const index = Math.floor(idx / size);
+      const from = index * size;
+      const to = from + size - 1;
+      segment = { index, size, from, to, leaderboard: await getSegmentLeaderboard(state.pollId, from, to, 50, true) };
+    }
+    res.json({ leaderboard, segment });
+  }));
+
+  // CSV of the full overall standings (name, phone, points) for reward processing.
+  router.get('/standings', asyncHandler(async (_req, res) => {
+    const raw = await redis.get(config.stateKey);
+    const state = raw ? JSON.parse(raw) : null;
+    const header = 'rank,name,phone,points';
+    if (!state?.pollId) return res.type('text/csv').send(header + '\n');
+    const rows = await getLeaderboard(state.pollId, 1000, true);
+    const lines = [header];
+    for (const r of rows) lines.push([r.rank, csvCell(r.name), csvCell(r.phone ?? ''), r.points].join(','));
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="poll-standings.csv"');
+    return res.send('﻿' + lines.join('\n'));
   }));
 
   // Tail error handler: a rejected async handler lands here as a 503 instead of

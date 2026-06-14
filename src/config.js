@@ -49,6 +49,11 @@ export const config = {
   scoreWeights: weights(),
   topNScoring: int('TOP_N_SCORING', 3),
 
+  // Segment leaderboard: a rolling sub-leaderboard that covers this many
+  // consecutive questions (default 10), so you can award prizes per block.
+  // The OVERALL leaderboard still accumulates across the whole poll.
+  segmentSize: int('SEGMENT_SIZE', 10),
+
   // Secret used to sign the session token cookie. MUST be set to a long random
   // value in production (same value across all workers/instances).
   sessionSecret: process.env.SESSION_SECRET ?? 'dev-insecure-secret-change-me',

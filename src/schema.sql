@@ -29,8 +29,11 @@ CREATE TABLE IF NOT EXISTS option (
 CREATE TABLE IF NOT EXISTS participant (
     id            UUID PRIMARY KEY,                -- == signed session token
     display_name  TEXT NOT NULL,
+    phone         TEXT,                            -- 10 digits; to contact prize winners. HOST-ONLY (never public; only last 4 shown to the user themselves)
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Existing deployments created `participant` before `phone` existed — add it idempotently.
+ALTER TABLE participant ADD COLUMN IF NOT EXISTS phone TEXT;
 
 -- Speeds up the /join duplicate-name check. That query does both an equality
 -- match (lower(display_name) = ...) and a prefix LIKE (... LIKE 'name (%'); the
@@ -77,6 +80,17 @@ CREATE TABLE IF NOT EXISTS score (
 
 -- Fast top-N leaderboard reads.
 CREATE INDEX IF NOT EXISTS idx_score_leaderboard ON score(poll_id, points DESC);
+
+-- Points each participant earned on EACH question. Powers the segment
+-- leaderboard (and its history): any block of questions, e.g. Q1-10, is just a
+-- SUM over that question-position range — so the "reset every 10 questions" is a
+-- range query, not a destructive wipe. `score` above stays the cumulative total.
+CREATE TABLE IF NOT EXISTS question_score (
+    question_id    INT  NOT NULL REFERENCES question(id) ON DELETE CASCADE,
+    participant_id UUID NOT NULL REFERENCES participant(id) ON DELETE CASCADE,
+    points         INT  NOT NULL DEFAULT 0,
+    PRIMARY KEY (question_id, participant_id)
+);
 
 -- Frozen result of each question (top options + counts) for audit/replay.
 CREATE TABLE IF NOT EXISTS question_result (

@@ -2,7 +2,7 @@ import express from 'express';
 import { query, withTx } from './db.js';
 import { redis, keys } from './redis.js';
 import { config } from './config.js';
-import { getLeaderboard, getParticipantStanding } from './leaderboard.js';
+import { getLeaderboard, getSegmentLeaderboard, getParticipantStanding } from './leaderboard.js';
 import { makeToken, setSessionCookie, withParticipant } from './auth.js';
 import { addClient } from './sse.js';
 import { asyncHandler, errorHandler } from './http-helpers.js';
@@ -24,6 +24,13 @@ export function buildRouter() {
     const name = String(req.body?.name ?? '').trim().slice(0, 40);
     if (name.length < 1) return res.status(400).json({ error: 'name required' });
 
+    // Phone: required, exactly 10 digits (strip any spaces/dashes/+). Used ONLY
+    // to contact prize winners — kept host-only, never broadcast publicly.
+    const phone = String(req.body?.phone ?? '').replace(/\D/g, '');
+    if (phone.length !== 10) {
+      return res.status(400).json({ error: 'a valid 10-digit phone number is required' });
+    }
+
     // Keep the leaderboard readable: if this display name (case-insensitive) is
     // already taken, append a numeric suffix, e.g. "Rahul" -> "Rahul (2)".
     const { rows: dup } = await query(
@@ -38,9 +45,9 @@ export function buildRouter() {
     // The id is the part before the final dot.
     const id = token.slice(0, token.lastIndexOf('.'));
     await query(
-      `INSERT INTO participant (id, display_name) VALUES ($1, $2)
+      `INSERT INTO participant (id, display_name, phone) VALUES ($1, $2, $3)
        ON CONFLICT (id) DO NOTHING`,
-      [id, finalName],
+      [id, finalName, phone],
     );
     // Set a cookie (same-origin clients) AND return the token in the body
     // (cross-origin React client stores it and sends it as a Bearer header).
@@ -72,9 +79,22 @@ export function buildRouter() {
   // --- Leaderboard (top N). ---
   router.get('/leaderboard', asyncHandler(async (req, res) => {
     const state = await readState();
-    if (!state?.pollId) return res.json({ leaderboard: [] });
+    if (!state?.pollId) return res.json({ leaderboard: [], segment: null });
     const limit = Math.min(parseInt(req.query.limit ?? '20', 10) || 20, 100);
-    res.json({ leaderboard: await getLeaderboard(state.pollId, limit) });
+    const leaderboard = await getLeaderboard(state.pollId, limit);
+
+    // Current segment standings (the 10-question block of the active/just-shown
+    // question). Null when no question is in view (idle/lobby).
+    let segment = null;
+    const idx = state.question?.index;
+    if (idx != null) {
+      const size = config.segmentSize;
+      const index = Math.floor(idx / size);
+      const from = index * size;
+      const to = from + size - 1;
+      segment = { index, size, from, to, leaderboard: await getSegmentLeaderboard(state.pollId, from, to, limit) };
+    }
+    res.json({ leaderboard, segment });
   }));
 
   // --- Vote. ---
