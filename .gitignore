@@ -6,3 +6,4 @@ dist/
 docker-compose.yml
 nginx-polling.conf
 nginx.conf
+CLAUDE.md

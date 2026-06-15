@@ -47,18 +47,26 @@ function phoneFor(i) {
   return String(9000000000 + (i % 1000000000)).slice(0, 10);
 }
 
+// Tally a reason string into a histogram object, so a black-box "joinFail=980"
+// becomes "network(ECONNRESET)×970, HTTP 503×10" — which tells you instantly
+// whether the bottleneck is YOUR machine (network throws) or the SERVER (HTTP errors).
+function bump(obj, key) {
+  obj[key] = (obj[key] ?? 0) + 1;
+}
+
 async function join(name, i) {
-  // Swallow transient network errors (ECONNRESET, etc.) so one blip under load
-  // doesn't abort the whole simulation — the caller treats null as a join fail.
+  // Return WHY a join failed instead of swallowing it: a thrown fetch (status 0)
+  // is a client-side network/port problem; a non-2xx status is the server saying no.
   try {
     const res = await fetch(`${BASE}/api/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, phone: phoneFor(i) }),
     });
-    return cookieFrom(res);
-  } catch {
-    return null;
+    if (!res.ok) return { cookie: null, status: res.status };
+    return { cookie: cookieFrom(res), status: res.status };
+  } catch (e) {
+    return { cookie: null, status: 0, err: e.cause?.code || e.name || 'network' };
   }
 }
 
@@ -126,9 +134,10 @@ async function consumeSse(res, onEvent, isDone) {
 }
 
 async function runVoterSse(i, stats) {
-  const cookie = await join(`Voter ${i}`, i);
+  const { cookie, status, err } = await join(`Voter ${i}`, i);
   if (!cookie) {
     stats.joinFail++;
+    bump(stats.joinReasons, status === 0 ? `network(${err})` : `HTTP ${status}`);
     return;
   }
   stats.joined++;
@@ -174,9 +183,13 @@ async function runVoterSse(i, stats) {
         try {
           const r = await vote(cookie, s.question.id, pickOptions(s.question));
           if (r.status === 200) stats.votes++;
-          else stats.voteRejected++;
+          else {
+            stats.voteRejected++;
+            bump(stats.rejReasons, r.status === 0 ? 'network' : `HTTP ${r.status}: ${r.body?.error ?? ''}`);
+          }
         } catch {
           stats.voteRejected++;
+          bump(stats.rejReasons, 'network');
         }
       })();
     }
@@ -194,9 +207,10 @@ async function runVoterSse(i, stats) {
 // --- poll mode (legacy): hammer /state on a loop, no live connection. ---
 
 async function runVoterPoll(i, stats) {
-  const cookie = await join(`Voter ${i}`, i);
+  const { cookie, status, err } = await join(`Voter ${i}`, i);
   if (!cookie) {
     stats.joinFail++;
+    bump(stats.joinReasons, status === 0 ? `network(${err})` : `HTTP ${status}`);
     return;
   }
   stats.joined++;
@@ -216,7 +230,10 @@ async function runVoterPoll(i, stats) {
       votedQuestions.add(st.question.id);
       const r = await vote(cookie, st.question.id, pickOptions(st.question));
       if (r.status === 200) stats.votes++;
-      else stats.voteRejected++;
+      else {
+        stats.voteRejected++;
+        bump(stats.rejReasons, r.status === 0 ? 'network' : `HTTP ${r.status}: ${r.body?.error ?? ''}`);
+      }
     }
     await sleep(400 + Math.random() * 600);
   }
@@ -225,7 +242,7 @@ async function runVoterPoll(i, stats) {
 
 async function main() {
   console.log(`Simulating ${VOTERS} voters against ${BASE}  [mode=${MODE}]`);
-  const stats = { joined: 0, joinFail: 0, connected: 0, sseFail: 0, votes: 0, voteRejected: 0, finished: 0 };
+  const stats = { joined: 0, joinFail: 0, connected: 0, sseFail: 0, votes: 0, voteRejected: 0, finished: 0, joinReasons: {}, rejReasons: {} };
   const runVoter = MODE === 'poll' ? runVoterPoll : runVoterSse;
 
   // Ramp: stagger each voter's start so they don't all fire at once.
@@ -248,7 +265,14 @@ async function main() {
   await Promise.allSettled(voters);
   clearInterval(ticker);
 
-  console.log(`\n\nFinal stats:`, stats);
+  const { joinReasons, rejReasons, ...counts } = stats;
+  console.log(`\n\nFinal stats:`, counts);
+  // The two histograms that tell you WHERE the limit is:
+  //   joinReasons full of network(...) -> YOUR machine (ports/CPU). Add machines.
+  //   joinReasons/rejReasons full of HTTP 5xx/429 -> the SERVER. Scale the box.
+  //   rejReasons full of HTTP 409 -> benign timing (late votes / question closed).
+  if (Object.keys(joinReasons).length) console.log(`\njoinFail reasons:`, joinReasons);
+  if (Object.keys(rejReasons).length) console.log(`vote-reject reasons:`, rejReasons);
   try {
     const lb = await (await fetch(`${BASE}/api/leaderboard?limit=10`)).json();
     console.log(`\nTop 10 leaderboard:`);
