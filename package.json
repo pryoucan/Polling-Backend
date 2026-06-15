@@ -8,7 +8,9 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "migrate": "node src/scripts/migrate.js",
-    "seed": "node src/scripts/seed.js"
+    "seed": "node src/scripts/seed.js",
+    "k6:load": "k6 run test/k6/load-test.js",
+    "k6:auto": "k6 run test/k6/auto-drive.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
