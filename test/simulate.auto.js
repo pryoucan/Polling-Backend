@@ -42,12 +42,18 @@ function cookieFrom(res) {
   return sc.split(';')[0]; // "pid=...."
 }
 
-async function join(name) {
+// Server requires a unique-ish 10-digit phone at join. Derive a deterministic
+// 10-digit number from the voter index so each virtual voter is distinct.
+function phoneFor(i) {
+  return String(9000000000 + (i % 1000000000)).slice(0, 10);
+}
+
+async function join(name, i) {
   try {
     const res = await fetch(`${BASE}/api/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, phone: phoneFor(i) }),
     });
     return cookieFrom(res);
   } catch {
@@ -109,7 +115,7 @@ async function consumeSse(res, onEvent, isDone) {
 }
 
 async function runVoter(i, stats, isStopped) {
-  const cookie = await join(`Voter ${i}`);
+  const cookie = await join(`Voter ${i}`, i);
   if (!cookie) {
     stats.joinFail++;
     return;

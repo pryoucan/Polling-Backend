@@ -41,14 +41,20 @@ async function getState(cookie) {
   return res.json();
 }
 
-async function join(name) {
+// Server requires a unique-ish 10-digit phone at join. Derive a deterministic
+// 10-digit number from the voter index so each virtual voter is distinct.
+function phoneFor(i) {
+  return String(9000000000 + (i % 1000000000)).slice(0, 10);
+}
+
+async function join(name, i) {
   // Swallow transient network errors (ECONNRESET, etc.) so one blip under load
   // doesn't abort the whole simulation — the caller treats null as a join fail.
   try {
     const res = await fetch(`${BASE}/api/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, phone: phoneFor(i) }),
     });
     return cookieFrom(res);
   } catch {
@@ -120,7 +126,7 @@ async function consumeSse(res, onEvent, isDone) {
 }
 
 async function runVoterSse(i, stats) {
-  const cookie = await join(`Voter ${i}`);
+  const cookie = await join(`Voter ${i}`, i);
   if (!cookie) {
     stats.joinFail++;
     return;
@@ -188,7 +194,7 @@ async function runVoterSse(i, stats) {
 // --- poll mode (legacy): hammer /state on a loop, no live connection. ---
 
 async function runVoterPoll(i, stats) {
-  const cookie = await join(`Voter ${i}`);
+  const cookie = await join(`Voter ${i}`, i);
   if (!cookie) {
     stats.joinFail++;
     return;
