@@ -38,6 +38,14 @@ services:
     networks:
       - polling-net
     restart: unless-stopped
+    # Each open SSE client = 1 file descriptor on this process. The stock
+    # container limit is 1024, which hard-caps us at ~1012 concurrent connections
+    # (everything past that gets connect-timeout / ECONNRESET). A live event has
+    # thousands of phones holding streams open, so raise the FD limit hard.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
 
 networks:
   polling-net:

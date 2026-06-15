@@ -7,3 +7,4 @@ docker-compose.yml
 nginx-polling.conf
 nginx.conf
 at-project-1.pem
+CLAUDE.md

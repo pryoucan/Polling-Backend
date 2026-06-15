@@ -48,16 +48,26 @@ function phoneFor(i) {
   return String(9000000000 + (i % 1000000000)).slice(0, 10);
 }
 
+// Tally a reason string into a histogram so "joinFail=358 / rejected=4137" becomes
+// a breakdown that tells you whether the limit is THIS machine (network throws) or
+// the SERVER (HTTP 5xx/429) or just benign timing (HTTP 409 = question closed).
+function bump(obj, key) {
+  obj[key] = (obj[key] ?? 0) + 1;
+}
+
 async function join(name, i) {
+  // status 0 = fetch threw (client-side network/port exhaustion); a non-2xx status
+  // = the server actively refused. Surfacing the difference is the whole point.
   try {
     const res = await fetch(`${BASE}/api/join`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, phone: phoneFor(i) }),
     });
-    return cookieFrom(res);
-  } catch {
-    return null;
+    if (!res.ok) return { cookie: null, status: res.status };
+    return { cookie: cookieFrom(res), status: res.status };
+  } catch (e) {
+    return { cookie: null, status: 0, err: e.cause?.code || e.name || 'network' };
   }
 }
 
@@ -68,9 +78,9 @@ async function vote(cookie, questionId, optionIds) {
       headers: { 'Content-Type': 'application/json', cookie },
       body: JSON.stringify({ questionId, optionIds }),
     });
-    return { status: res.status };
+    return { status: res.status, body: await res.json().catch(() => ({})) };
   } catch {
-    return { status: 0 };
+    return { status: 0, body: {} };
   }
 }
 
@@ -115,9 +125,10 @@ async function consumeSse(res, onEvent, isDone) {
 }
 
 async function runVoter(i, stats, isStopped) {
-  const cookie = await join(`Voter ${i}`, i);
+  const { cookie, status, err } = await join(`Voter ${i}`, i);
   if (!cookie) {
     stats.joinFail++;
+    bump(stats.joinReasons, status === 0 ? `network(${err})` : `HTTP ${status}`);
     return;
   }
   stats.joined++;
@@ -154,7 +165,10 @@ async function runVoter(i, stats, isStopped) {
         await sleep(200 + Math.random() * 1300);
         const r = await vote(cookie, s.question.id, pickOptions(s.question));
         if (r.status === 200) stats.votes++;
-        else stats.voteRejected++;
+        else {
+          stats.voteRejected++;
+          bump(stats.rejReasons, r.status === 0 ? 'network' : `HTTP ${r.status}: ${r.body?.error ?? ''}`);
+        }
       })();
     }
   };
@@ -280,7 +294,7 @@ async function main() {
     process.exit(1);
   }
 
-  const stats = { joined: 0, joinFail: 0, connected: 0, sseFail: 0, votes: 0, voteRejected: 0, finished: 0 };
+  const stats = { joined: 0, joinFail: 0, connected: 0, sseFail: 0, votes: 0, voteRejected: 0, finished: 0, joinReasons: {}, rejReasons: {} };
   let stopped = false;
   const isStopped = () => stopped;
 
@@ -318,7 +332,12 @@ async function main() {
   await Promise.allSettled([sleep(1500), ...voters.map((p) => Promise.race([p, sleep(1500)]))]);
   clearInterval(ticker);
 
-  console.log(`\n\nFinal stats:`, stats);
+  const { joinReasons, rejReasons, ...counts } = stats;
+  console.log(`\n\nFinal stats:`, counts);
+  // network(...) -> this machine's limit (ports/CPU). HTTP 5xx/429 -> server limit.
+  // HTTP 409 -> benign (question closed / not open when the late vote landed).
+  if (Object.keys(joinReasons).length) console.log(`\njoinFail reasons:`, joinReasons);
+  if (Object.keys(rejReasons).length) console.log(`vote-reject reasons:`, rejReasons);
   try {
     const lb = await (await fetch(`${BASE}/api/leaderboard?limit=10`)).json();
     console.log(`\nTop 10 leaderboard:`);
